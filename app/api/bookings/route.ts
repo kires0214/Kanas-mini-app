@@ -50,7 +50,7 @@ export async function POST(request: Request): Promise<Response> {
         "(($3::date + $4::time) AT TIME ZONE 'Asia/Almaty') + interval '1 hour', " +
         "f.price_kzt, now() + interval '20 minutes' FROM football_fields f " +
         "WHERE f.id=$1 AND f.active=true AND $4::time >= f.opens_at " +
-        "AND ($4::time + interval '1 hour') <= f.closes_at " +
+        "AND ($3::date + $4::time + interval '1 hour') <= ($3::date + f.closes_at) " +
         "AND mod(extract(epoch from ($4::time - f.opens_at))::int, 3600) = 0 " +
         "AND (($3::date + $4::time) AT TIME ZONE 'Asia/Almaty') > now() + interval '5 minutes' " +
         "AND $3::date BETWEEN (now() AT TIME ZONE 'Asia/Almaty')::date " +
