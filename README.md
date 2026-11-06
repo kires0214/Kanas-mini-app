@@ -29,7 +29,7 @@ Prerequisites: Node.js 22+, PostgreSQL, a Telegram bot from BotFather, valid mer
 
 1. Copy .env.example to .env and set the four environment variables below.
 2. Install: npm install
-3. Create schema once: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/001_initial.sql
+3. Apply versioned schema: npm run db:migrate (DATABASE_URL must be set).
 4. Develop: npm run dev (Telegram requires a public HTTPS URL; use a secure dev tunnel).
 5. For Railway, connect this GitHub repository as the Next.js service and provision a PostgreSQL
    service in the **same Railway project**. Supply DATABASE_URL with its Railway service reference.
@@ -88,6 +88,10 @@ exercise concurrent booking attempts on the same field/time (only one must succe
 hours, 20-minute expiry, review not automatically confirming payment, admin authorization
 (403 for customers), confirmed/rejected decision notifications and Kazakhstan timezone behavior.
 
-GitHub CI executes TypeScript typecheck, basic unit tests and Next.js build.
+GitHub CI executes TypeScript typecheck, unit tests, real PostgreSQL 18 integration/concurrency tests,
+Next.js build and a production HTTP booking/payment smoke test. Telegram transport is mocked in QA.
 **CI by itself does not prove live DB integration or external Telegram/BotFather configuration.**
 Do not enable production users before those end-to-end checks.
+
+See [deployment and operating guide](docs/RELEASE.md) for Railway `simple-field-management`,
+versioned migrations, request idempotency, disputed/late payments, durable notification retries and launch gates.

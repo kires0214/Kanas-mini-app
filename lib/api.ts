@@ -11,7 +11,8 @@ export function jsonError(error: unknown): Response {
   if (error instanceof TelegramAuthError) {
     return Response.json({ error: error.message }, { status: 401 });
   }
-  console.error('API request failed', error instanceof Error ? error.message : 'Unknown error');
+  // Database/network messages may contain connection strings or signed request data.
+  console.error('API request failed', error instanceof Error ? error.name : 'Unknown error');
   return Response.json({ error: 'Ошибка сервера. Попробуйте позже.' }, { status: 500 });
 }
 
@@ -24,9 +25,13 @@ export async function authenticated(
       request.headers.get('x-telegram-init-data') || '',
       process.env.TELEGRAM_BOT_TOKEN || '',
     );
-    return await callback(user);
+    const response = await callback(user);
+    response.headers.set('Cache-Control', 'no-store');
+    return response;
   } catch (error) {
-    return jsonError(error);
+    const response = jsonError(error);
+    response.headers.set('Cache-Control', 'no-store');
+    return response;
   }
 }
 
@@ -48,9 +53,20 @@ export async function readObject(request: Request): Promise<Record<string, unkno
 }
 
 export function positiveId(value: unknown): number {
+  if ((typeof value !== 'number' && typeof value !== 'string') ||
+      (typeof value === 'string' && !/^[1-9]\d*$/.test(value))) {
+    throw new ApiError(400, 'Неверный идентификатор');
+  }
   const num = Number(value);
   if (!Number.isSafeInteger(num) || num <= 0) throw new ApiError(400, 'Неверный идентификатор');
   return num;
+}
+
+export function uuidValue(value: unknown): string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value)) {
+    throw new ApiError(400, 'Неверный идентификатор запроса или брони');
+  }
+  return value.toLowerCase();
 }
 
 export function dateValue(value: unknown): string {
@@ -74,7 +90,7 @@ export function paymentUrl(): string | null {
   if (!raw) return null;
   try {
     const parsed = new URL(raw);
-    return parsed.protocol === 'https:' ? parsed.toString() : null;
+    return parsed.protocol === 'https:' && !parsed.username && !parsed.password ? parsed.toString() : null;
   } catch {
     return null;
   }

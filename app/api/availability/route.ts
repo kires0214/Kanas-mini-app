@@ -15,7 +15,7 @@ export async function GET(request: Request): Promise<Response> {
         "SELECT to_char(slot_time, 'HH24:MI') AS time, " +
         "((slot_time AT TIME ZONE 'Asia/Almaty') > now() + interval '5 minutes' " +
         "AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.field_id = f.id " +
-        "AND b.status IN ('held', 'review', 'confirmed') " +
+        "AND (b.status IN ('review', 'disputed', 'confirmed') OR (b.status='held' AND b.hold_expires_at>clock_timestamp())) " +
         "AND tstzrange(b.starts_at, b.ends_at, '[)') && " +
         "tstzrange(slot_time AT TIME ZONE 'Asia/Almaty', " +
         "(slot_time AT TIME ZONE 'Asia/Almaty') + interval '1 hour', '[)'))) AS available " +

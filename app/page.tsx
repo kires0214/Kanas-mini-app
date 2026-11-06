@@ -1,14 +1,15 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { requestJson } from '@/lib/client-api';
 
 type TelegramApp = { initData: string; ready(): void; expand(): void; openLink(url: string): void };
 declare global { interface Window { Telegram?: { WebApp: TelegramApp } } }
 
 type Field = { id: string; title: string; description: string; price_kzt: number; opens_at: string; closes_at: string; active?: boolean };
 type Slot = { time: string; available: boolean };
-type Booking = { id: string; field_id: string; field_title: string; price_kzt: number; status: string; date: string; time: string; hold_expires_at: string };
-type AdminBooking = Booking & { telegram_id: string; first_name: string; username: string | null };
+type Booking = { id: string; field_id: string; field_title: string; price_kzt: number; status: string; date: string; time: string; hold_expires_at: string; decision_note: string | null; payment_issue_open: boolean };
+type AdminBooking = Booking & { telegram_id: string; first_name: string; username: string | null; overdue: boolean };
 type Profile = { user: { id: number; first_name: string }; is_admin: boolean; payment_url: string | null };
 type FieldForm = { id: string; title: string; description: string; price_kzt: string; opens_at: string; closes_at: string; active: boolean };
 type Tab = 'book' | 'mine' | 'admin';
@@ -19,7 +20,7 @@ const today = (): string => new Date(Date.now() + 5 * 3600000).toISOString().sli
 const limitDay = (): string => new Date(Date.now() + (30 * 24 + 5) * 3600000).toISOString().slice(0, 10);
 const labels: Record<string, string> = {
   held: 'Ожидает оплаты', review: 'Проверка оплаты', confirmed: 'Подтверждено',
-  rejected: 'Отклонено', expired: 'Время оплаты истекло',
+  rejected: 'Отклонено', expired: 'Время оплаты истекло', disputed: 'Уточнение оплаты',
 };
 
 export default function Home() {
@@ -39,15 +40,14 @@ export default function Home() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [refresh, setRefresh] = useState(0);
+  const [boot, setBoot] = useState(0);
+  const [slotsLoading, setSlotsLoading] = useState(false);
+  const [pendingNotifications, setPendingNotifications] = useState(0);
+  const mutation = useRef(false);
+  const bookingRequest = useRef<{ selection: string; id: string } | null>(null);
 
   async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const result = await fetch(path, {
-      ...options,
-      headers: { 'x-telegram-init-data': auth, ...(options.body ? { 'content-type': 'application/json' } : {}), ...options.headers },
-    });
-    const payload = await result.json() as T & { error?: string };
-    if (!result.ok) throw new Error(payload.error || 'Ошибка запроса');
-    return payload;
+    return requestJson<T>(path, auth, options);
   }
 
   useEffect(() => {
@@ -61,6 +61,7 @@ export default function Home() {
   useEffect(() => {
     if (!auth) return;
     let alive = true;
+    setError('');
     Promise.all([api<Profile>('/api/me'), api<{ fields: Field[] }>('/api/fields')])
       .then(([me, data]) => {
         if (!alive) return;
@@ -70,17 +71,34 @@ export default function Home() {
       })
       .catch((reason: unknown) => { if (alive) setError(reason instanceof Error ? reason.message : 'Ошибка загрузки'); });
     return () => { alive = false; };
-  }, [auth]);
+  }, [auth, boot]);
 
   useEffect(() => {
     if (!auth || !fieldId) { setSlots([]); return; }
     let alive = true;
     setHour('');
+    setSlots([]);
+    setSlotsLoading(true);
     api<{ slots: Slot[] }>('/api/availability?fieldId=' + encodeURIComponent(fieldId) + '&date=' + encodeURIComponent(day))
       .then((data) => { if (alive) setSlots(data.slots); })
-      .catch((reason: unknown) => { if (alive) setMessage(reason instanceof Error ? reason.message : 'Ошибка расписания'); });
+      .catch((reason: unknown) => { if (alive) setMessage(reason instanceof Error ? reason.message : 'Ошибка расписания'); })
+      .finally(() => { if (alive) setSlotsLoading(false); });
     return () => { alive = false; };
   }, [auth, fieldId, day, refresh]);
+
+  useEffect(() => {
+    if (!profile) return;
+    const update = () => {
+      if (document.visibilityState !== 'visible' || mutation.current) return;
+      if (tab === 'book') setRefresh((value) => value + 1);
+      else void (tab === 'mine' ? loadMine() : loadAdmin()).catch((reason: unknown) =>
+        setMessage(reason instanceof Error ? reason.message : 'Ошибка обновления'));
+    };
+    const interval = window.setInterval(update, 30000);
+    document.addEventListener('visibilitychange', update);
+    window.addEventListener('online', update);
+    return () => { window.clearInterval(interval); document.removeEventListener('visibilitychange', update); window.removeEventListener('online', update); };
+  }, [profile, tab, auth]);
 
   async function loadMine(): Promise<void> {
     const data = await api<{ bookings: Booking[] }>('/api/bookings');
@@ -88,11 +106,12 @@ export default function Home() {
   }
   async function loadAdmin(): Promise<void> {
     const [bookings, allFields] = await Promise.all([
-      api<{ bookings: AdminBooking[] }>('/api/admin/bookings'),
+      api<{ bookings: AdminBooking[]; notifications: { pending: number } }>('/api/admin/bookings'),
       api<{ fields: Field[] }>('/api/admin/fields'),
     ]);
     setAdminBookings(bookings.bookings);
     setAdminFields(allFields.fields);
+    setPendingNotifications(bookings.notifications.pending);
   }
   async function switchTab(next: Tab): Promise<void> {
     setTab(next);
@@ -107,28 +126,38 @@ export default function Home() {
   }
 
   async function createBooking(): Promise<void> {
-    if (!hour || !fieldId || busy) return;
+    if (!hour || !fieldId || mutation.current || slotsLoading) return;
+    mutation.current = true;
     setBusy(true);
     try {
-      await api('/api/bookings', { method: 'POST', body: JSON.stringify({ field_id: Number(fieldId), date: day, time: hour }) });
+      const selection = fieldId + ':' + day + ':' + hour;
+      if (!bookingRequest.current) {
+        try { bookingRequest.current = JSON.parse(sessionStorage.getItem('kanas-pending-booking') || 'null'); } catch { /* Storage can be disabled in WebViews. */ }
+      }
+      if (bookingRequest.current?.selection !== selection) bookingRequest.current = { selection, id: crypto.randomUUID() };
+      try { sessionStorage.setItem('kanas-pending-booking', JSON.stringify(bookingRequest.current)); } catch { /* In-memory retry still works. */ }
+      await api('/api/bookings', { method: 'POST', body: JSON.stringify({ field_id: Number(fieldId), date: day, time: hour, request_id: bookingRequest.current.id }) });
+      bookingRequest.current = null;
+      try { sessionStorage.removeItem('kanas-pending-booking'); } catch { /* Optional storage. */ }
       await switchTab('mine');
       setMessage('Час зарезервирован на 20 минут. Оплатите и отметьте оплату.');
       setRefresh((x) => x + 1);
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : 'Ошибка бронирования');
       setRefresh((x) => x + 1);
-    } finally { setBusy(false); }
+    } finally { mutation.current = false; setBusy(false); }
   }
 
   async function markPaid(id: string): Promise<void> {
-    if (busy) return;
+    if (mutation.current) return;
+    mutation.current = true;
     setBusy(true);
     try {
-      await api('/api/bookings/' + encodeURIComponent(id) + '/paid', { method: 'POST' });
+      const result = await api<{ payment_issue_open: boolean }>('/api/bookings/' + encodeURIComponent(id) + '/paid', { method: 'POST' });
       await loadMine();
-      setMessage('Передано администратору. Бронь будет подтверждена только после проверки денег в Kaspi Pay.');
+      setMessage(result.payment_issue_open ? 'Поздний платёж передан администратору. Слот не гарантирован: дождитесь согласования другого времени или возврата.' : 'Передано администратору. Бронь будет подтверждена только после проверки денег в Kaspi Pay.');
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Ошибка'); }
-    finally { setBusy(false); }
+    finally { mutation.current = false; setBusy(false); }
   }
 
   function openPayment(): void {
@@ -138,18 +167,21 @@ export default function Home() {
     else window.open(url, '_blank', 'noopener,noreferrer');
   }
 
-  async function review(id: string, decision: 'confirm' | 'reject'): Promise<void> {
-    if (busy) return;
+  async function review(id: string, decision: 'confirm' | 'reject' | 'dispute' | 'resolve'): Promise<void> {
+    if (mutation.current) return;
     if (decision === 'confirm' && !window.confirm('Вы лично сверили поступление денег в Kaspi Pay?')) return;
+    const note = decision === 'confirm' ? '' : window.prompt('Укажите причину и согласованный порядок решения. При споре оставьте бронь на уточнении; отклоняйте только после проверки денег и согласования возврата.');
+    if (note === null) return;
+    mutation.current = true;
     setBusy(true);
     try {
       await api('/api/admin/bookings/' + encodeURIComponent(id) + '/decision', {
-        method: 'POST', body: JSON.stringify({ decision }),
+        method: 'POST', body: JSON.stringify({ decision, note, payment_verified: decision === 'confirm' }),
       });
       await loadAdmin();
-      setMessage(decision === 'confirm' ? 'Оплата подтверждена.' : 'Бронь отклонена.');
+      setMessage('Решение сохранено. Клиент получит уведомление.');
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Ошибка'); }
-    finally { setBusy(false); }
+    finally { mutation.current = false; setBusy(false); }
   }
 
   function editField(field: Field): void {
@@ -159,7 +191,8 @@ export default function Home() {
   }
 
   async function saveField(): Promise<void> {
-    if (busy) return;
+    if (mutation.current) return;
+    mutation.current = true;
     setBusy(true);
     try {
       await api('/api/admin/fields', {
@@ -179,7 +212,7 @@ export default function Home() {
       setRefresh((x) => x + 1);
       setMessage('Поле сохранено.');
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Ошибка'); }
-    finally { setBusy(false); }
+    finally { mutation.current = false; setBusy(false); }
   }
 
   const currentField = fields.find((field) => String(field.id) === fieldId);
@@ -190,7 +223,7 @@ export default function Home() {
         <h1>Твоё поле.<br/><em>Твоё время.</em></h1><p>Выбирайте свободный час и бронируйте в Telegram.</p>
         {profile && <span className="greeting">Привет, {profile.user.first_name}!</span>}
       </section>
-      {error && <p className="alert error" role="alert">{error}</p>}
+      {error && <div className="alert error" role="alert"><p>{error}</p><button className="secondary" onClick={() => setBoot((value) => value + 1)}>Обновить</button></div>}
       {message && <p className="alert" role="status">{message}</p>}
       {!profile && !error && <p className="loading">Загрузка...</p>}
       {profile && <>
@@ -199,12 +232,13 @@ export default function Home() {
           <button className={tab === 'mine' ? 'active' : ''} onClick={() => void switchTab('mine')}>Мои брони</button>
           {profile.is_admin && <button className={tab === 'admin' ? 'active' : ''} onClick={() => void switchTab('admin')}>Админ</button>}
         </nav>
+        <button className="secondary" disabled={busy} onClick={() => void switchTab(tab)}>Обновить</button>
         {tab === 'book' && <section>
           <h2>Выберите поле</h2>
           {!fields.length && <div className="empty">Администратор ещё не добавил поля.</div>}
           <div className="stack">{fields.map((field) =>
             <button key={field.id} className={'field ' + (fieldId === String(field.id) ? 'chosen' : '')}
-              onClick={() => setFieldId(String(field.id))}>
+              onClick={() => { setHour(''); setSlots([]); setFieldId(String(field.id)); }}>
               <div className="field-symbol">⚽</div>
               <div className="field-info"><strong>{field.title}</strong>
                 {field.description && <small>{field.description}</small>}
@@ -213,16 +247,16 @@ export default function Home() {
             </button>)}</div>
           {currentField && <>
             <h2 className="spaced">Дата игры</h2>
-            <input className="date" type="date" min={today()} max={limitDay()} value={day} onChange={(e) => setDay(e.target.value)} />
+            <input className="date" aria-label="Дата игры, время Астаны UTC+5" type="date" min={today()} max={limitDay()} value={day} onChange={(e) => { setHour(''); setSlots([]); setDay(e.target.value); }} />
             <h2 className="spaced">Свободное время</h2>
             <div className="slots">{slots.map((slot) =>
               <button key={slot.time} disabled={!slot.available} className={hour === slot.time ? 'chosen' : ''}
                 onClick={() => setHour(slot.time)}>{slot.time}</button>)}</div>
-            {!slots.length && <p className="empty">На эту дату нет доступных часов.</p>}
+            {slotsLoading ? <p className="loading">Обновляем расписание…</p> : !slots.length && <p className="empty">На эту дату нет доступных часов.</p>}
             <div className="checkout"><div><small>Аренда на 1 час</small><strong>{money(currentField.price_kzt)}</strong></div>
-              <button className="primary" disabled={!hour || busy} onClick={() => void createBooking()}>
+              <button className="primary" disabled={!hour || busy || slotsLoading || !profile.payment_url} onClick={() => void createBooking()}>
                 {busy ? 'Подождите...' : hour ? 'Забронировать на ' + hour : 'Выберите время'}
-              </button><p>Бронь удерживается 20 минут до отметки оплаты.</p></div>
+              </button><p>{profile.payment_url ? 'Время Астаны (UTC+5). Бронь удерживается 20 минут до отметки оплаты.' : 'Приём бронирований временно закрыт: оплата ещё не настроена.'}</p></div>
           </>}
         </section>}
         {tab === 'mine' && <section><h2>Мои бронирования</h2>
@@ -231,18 +265,22 @@ export default function Home() {
             <article className="booking" key={b.id}>
               <div className="between"><strong>{b.field_title}</strong><span className={'status ' + b.status}>{labels[b.status] || b.status}</span></div>
               <p>{b.date} · {b.time} · {money(b.price_kzt)}</p><small>Бронь #{b.id.slice(0, 8)}</small>
-              {b.status === 'held' && <div className="actions">
+              {b.decision_note && <p className="fineprint">Администратор: {b.decision_note}</p>}
+              {b.status === 'held' && new Date(b.hold_expires_at).getTime() > Date.now() && <div className="actions">
                 <p>Оплатить до {new Date(b.hold_expires_at).toLocaleTimeString('ru-RU', { timeZone: 'Asia/Almaty', hour: '2-digit', minute: '2-digit' })} (Астана)</p>
                 <button disabled={!profile.payment_url} className="primary" onClick={openPayment}>
                   {profile.payment_url ? 'Оплатить через Kaspi' : 'Ссылка оплаты не настроена'}</button>
                 <button className="secondary" disabled={busy || !profile.payment_url} onClick={() => void markPaid(b.id)}>Я оплатил</button>
                 <p className="fineprint">Проверьте сумму перед оплатой. Отметка об оплате не подтверждает бронь автоматически.</p>
               </div>}
-              {b.status === 'review' && <p className="fineprint">Администратор проверяет платёж.</p>}
+              {['review','disputed'].includes(b.status) && <p className="fineprint">Администратор проверяет платёж. Слот сохранён до решения. Повторно оплачивать не нужно.</p>}
+              {b.payment_issue_open && <p className="alert">Поздний платёж на разборе. Дождитесь согласования времени или возврата.</p>}
+              {b.status === 'expired' && !b.payment_issue_open && !b.decision_note && <button className="secondary" disabled={busy} onClick={() => void markPaid(b.id)}>Уже оплатили? Сообщить администратору</button>}
             </article>)}</div>
         </section>}
         {tab === 'admin' && profile.is_admin && <section>
           <h2>Проверка оплат</h2>
+          {pendingNotifications > 0 && <div className="alert"><p>Не доставлено уведомлений: {pendingNotifications}. Статусы бронирований сохранены.</p><button className="secondary" disabled={busy} onClick={() => { void api('/api/admin/notifications', { method: 'POST' }).then(loadAdmin).catch((reason: unknown) => setMessage(reason instanceof Error ? reason.message : 'Ошибка отправки')); }}>Повторить отправку</button></div>}
           {!adminBookings.length && <p className="empty">Активных бронирований нет.</p>}
           <div className="stack">{adminBookings.map((b) =>
             <article key={b.id} className="booking"><div className="between"><strong>{b.field_title}</strong>
@@ -250,8 +288,12 @@ export default function Home() {
               <p>{b.date} · {b.time} · {money(b.price_kzt)}</p>
               <p>Клиент: {b.first_name} {b.username ? '@' + b.username : ''}</p>
               <small>Telegram: {b.telegram_id} · #{b.id.slice(0, 8)}</small>
-              {b.status === 'review' && <div className="actions">
+              {b.overdue && <p className="alert">Проверка дольше 24 часов. Свяжитесь с клиентом; слот остаётся занят.</p>}
+              {b.decision_note && <p className="fineprint">{b.decision_note}</p>}
+              {b.payment_issue_open && <div className="actions"><p>Поздний платёж: время не зарезервировано. Проверьте деньги и согласуйте возврат или другое время.</p><button disabled={busy} className="secondary" onClick={() => void review(b.id, 'resolve')}>Записать решение по платежу</button></div>}
+              {['review','disputed'].includes(b.status) && <div className="actions">
                 <button disabled={busy} className="primary" onClick={() => void review(b.id, 'confirm')}>Подтвердить оплату</button>
+                <button disabled={busy} className="secondary" onClick={() => void review(b.id, 'dispute')}>Нужно уточнение — сохранить слот</button>
                 <button disabled={busy} className="danger" onClick={() => void review(b.id, 'reject')}>Отклонить</button>
               </div>}
             </article>)}</div>

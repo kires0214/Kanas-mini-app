@@ -19,6 +19,9 @@ export function verifyTelegramInitData(
   }
 
   const params = new URLSearchParams(initData);
+  if ([...params.keys()].some((name) => params.getAll(name).length !== 1)) {
+    throw new TelegramAuthError('Повторяющиеся данные авторизации Telegram');
+  }
   const providedHashes = params.getAll('hash');
   if (providedHashes.length !== 1 || !/^[a-f0-9]{64}$/i.test(providedHashes[0])) {
     throw new TelegramAuthError('Недействительная подпись Telegram');
@@ -27,7 +30,7 @@ export function verifyTelegramInitData(
   const key = createHmac('sha256', 'WebAppData').update(token).digest();
   const dataCheckString = [...params.entries()]
     .filter(([name]) => name !== 'hash')
-    .sort(([first], [second]) => first.localeCompare(second))
+    .sort(([first], [second]) => first < second ? -1 : first > second ? 1 : 0)
     .map(([name, value]) => name + '=' + value)
     .join('\n');
   const expectedHash = createHmac('sha256', key).update(dataCheckString).digest();
@@ -53,7 +56,8 @@ export function verifyTelegramInitData(
         (user.username !== undefined && typeof user.username !== 'string')) {
       throw new Error('Invalid user');
     }
-    return user as TelegramUser;
+    return { id: user.id!, first_name: user.first_name,
+      ...(typeof user.username === 'string' ? { username: user.username.slice(0, 64) } : {}) };
   } catch {
     throw new TelegramAuthError('Нет корректного пользователя Telegram');
   }
@@ -67,9 +71,9 @@ export function isAdministrator(telegramId: number): boolean {
     .some((value) => value === String(telegramId));
 }
 
-export async function sendTelegramMessage(chatId: number, message: string): Promise<void> {
+export async function sendTelegramMessage(chatId: number, message: string): Promise<boolean> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) return;
+  if (!token) return false;
   try {
     const response = await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
       method: 'POST',
@@ -81,14 +85,9 @@ export async function sendTelegramMessage(chatId: number, message: string): Prom
       }),
       signal: AbortSignal.timeout(5000),
     });
-    if (!response.ok) console.warn('Telegram delivery failed:', response.status);
+    const body = await response.json() as { ok?: boolean };
+    return response.ok && body.ok === true;
   } catch {
-    console.warn('Telegram delivery failed: connection error');
+    return false;
   }
-}
-
-export async function notifyAdministrators(message: string): Promise<void> {
-  const ids = (process.env.ADMIN_TELEGRAM_IDS || '')
-    .split(',').map((item) => item.trim()).filter((item) => /^\d+$/.test(item));
-  await Promise.all(ids.map((id) => sendTelegramMessage(Number(id), message)));
 }

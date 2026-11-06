@@ -1,4 +1,3 @@
-BEGIN;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 CREATE TABLE IF NOT EXISTS football_fields (
@@ -37,14 +36,17 @@ CREATE TABLE IF NOT EXISTS bookings (
   CHECK (ends_at = starts_at + interval '1 hour')
 );
 
+DO $$ BEGIN
+IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='bookings'::regclass AND conname='unique_active_field_interval') THEN
 ALTER TABLE bookings
   ADD CONSTRAINT unique_active_field_interval
   EXCLUDE USING gist (
     field_id WITH =,
     tstzrange(starts_at, ends_at, '[)') WITH &&
   ) WHERE (status IN ('held', 'review', 'confirmed'));
+END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS bookings_customer_idx ON bookings (telegram_id, starts_at DESC);
 CREATE INDEX IF NOT EXISTS bookings_field_start_idx ON bookings (field_id, starts_at);
 CREATE INDEX IF NOT EXISTS bookings_hold_expiration_idx ON bookings (hold_expires_at) WHERE status = 'held';
-COMMIT;

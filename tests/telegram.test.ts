@@ -41,3 +41,11 @@ test('rejects expired signed data', () => {
 test('rejects signed invalid user id', () => {
   assert.throws(() => verifyTelegramInitData(signedInitData({ id: -1, first_name: 'Invalid' }), token, now), TelegramAuthError);
 });
+
+test('rejects duplicate fields, future data, missing token, oversized data and malformed signature', () => {
+  assert.throws(() => verifyTelegramInitData(signedInitData()+'&auth_date='+now,token,now), TelegramAuthError);
+  assert.throws(() => verifyTelegramInitData(signedInitData(undefined,now+61),token,now), TelegramAuthError);
+  assert.throws(() => verifyTelegramInitData(signedInitData(),'',now), TelegramAuthError);
+  assert.throws(() => verifyTelegramInitData('a'.repeat(8193),token,now), TelegramAuthError);
+  assert.throws(() => verifyTelegramInitData('hash=nope',token,now), TelegramAuthError);
+});
