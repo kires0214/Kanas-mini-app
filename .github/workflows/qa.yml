@@ -44,5 +44,6 @@ jobs:
         with:
           name: qa-resource-ledger
           path: .task-resources.jsonl
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
